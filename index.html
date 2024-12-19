@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Doom-like Prototype (Occlusion)</title>
+<style>
+  body { margin:0; background:#222; color:#fff; font-family:sans-serif; overflow:hidden; }
+  #screen { display:block; margin:0 auto; background:#000; }
+  #ui { position:absolute; top:10px; left:10px; color:#fff; font-family:sans-serif; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="320" height="200"></canvas>
+<div id="ui">
+  <div>Health: <span id="health">100</span></div>
+  <div>Ammo: <span id="ammo">10</span></div>
+  <div>W/A/S/D: 이동, 마우스 이동: 시점회전</div>
+  <div>왼쪽클릭: 사격, 오른쪽클릭: 재장전</div>
+</div>
+
+<script>
+// 이전 예시에서 개선점만 주석으로 강조하고, 나머지 부분은 그대로 유지 또는 축약
+
+const MAP_SIZE = 16;
+const WALL = 1;
+const EMPTY = 0;
+const ITEM_AMMO = 2;
+const ITEM_HEALTH = 3;
+const ENEMY = 4;
+
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const healthUI = document.getElementById('health');
+const ammoUI = document.getElementById('ammo');
+
+const screenWidth = canvas.width;
+const screenHeight = canvas.height;
+const fov = Math.PI / 3;
+const numRays = screenWidth;
+
+let map = [];
+let playerX = 8;
+let playerY = 8;
+let playerAngle = 0;
+let playerHealth = 100;
+let playerAmmo = 10;
+let enemies = [];
+let projectiles = [];
+
+let keys = {};
+let mouseDeltaX = 0;
+let lastTime = performance.now();
+
+let isReloading = false;
+let lastReloadTime = 0;
+const reloadTime = 1500;
+let lastShootTime = 0;
+const shootCooldown = 500;
+let moveSpeed = 0.01;
+const rotSpeed = 0.0015;
+let hitOverlayAlpha = 0;
+
+function generateMap() {
+  map = [];
+  for (let y = 0; y < MAP_SIZE; y++) {
+    let row = [];
+    for (let x = 0; x < MAP_SIZE; x++) {
+      if (x===0||x===MAP_SIZE-1||y===0||y===MAP_SIZE-1) row.push(WALL);
+      else {
+        if(Math.random()<0.1) row.push(WALL);
+        else row.push(EMPTY);
+      }
+    }
+    map.push(row);
+  }
+
+  for(let i=0;i<5;i++){
+    const ix=(Math.random()*(MAP_SIZE-2)+1)|0;
+    const iy=(Math.random()*(MAP_SIZE-2)+1)|0;
+    if(map[iy][ix]===EMPTY){
+      map[iy][ix]=(Math.random()<0.5)?ITEM_AMMO:ITEM_HEALTH;
+    }
+  }
+
+  enemies=[];
+  for(let i=0;i<5;i++){
+    const ex=(Math.random()*(MAP_SIZE-2)+1)|0;
+    const ey=(Math.random()*(MAP_SIZE-2)+1)|0;
+    if(map[ey][ex]===EMPTY){
+      map[ey][ex]=ENEMY;
+      enemies.push({x:ex+0.5,y:ey+0.5,health:50,lastShotTime:0});
+    }
+  }
+}
+
+function castRay(angle) {
+  let distance=0;
+  const stepSize=0.01;
+  const eyeX=Math.cos(angle);
+  const eyeY=Math.sin(angle);
+  while(distance<MAP_SIZE){
+    distance+=stepSize;
+    const testX=Math.floor(playerX+eyeX*distance);
+    const testY=Math.floor(playerY+eyeY*distance);
+    if(testX<0||testX>=MAP_SIZE||testY<0||testY>=MAP_SIZE) {
+      return distance;
+    }
+    if(map[testY][testX]===WALL){
+      return distance;
+    }
+  }
+  return distance;
+}
+
+function drawScene() {
+  ctx.fillStyle='#333';
+  ctx.fillRect(0,0,screenWidth,screenHeight/2);
+  ctx.fillStyle='#555';
+  ctx.fillRect(0,screenHeight/2,screenWidth,screenHeight/2);
+
+  // 벽
+  for (let x=0;x<numRays;x++){
+    const rayAngle=playerAngle - fov/2+(x/numRays)*fov;
+    const dist=castRay(rayAngle);
+    const lineHeight=Math.floor(screenHeight/dist);
+    const ceiling=(screenHeight/2)-(lineHeight/2);
+    const shade=Math.max(0,255-dist*15);
+    ctx.fillStyle=`rgb(${shade},${shade},${shade})`;
+    ctx.fillRect(x,ceiling,1,lineHeight);
+  }
+
+  // 스프라이트(적,아이템,탄환)
+  let sprites=[];
+  enemies.forEach(e=>{if(e.health>0) sprites.push({x:e.x,y:e.y,type:'enemy'});});
+  for(let y=0;y<MAP_SIZE;y++){
+    for(let x=0;x<MAP_SIZE;x++){
+      if(map[y][x]===ITEM_AMMO) sprites.push({x:x+0.5,y:y+0.5,type:'ammo'});
+      else if(map[y][x]===ITEM_HEALTH) sprites.push({x:x+0.5,y:y+0.5,type:'health'});
+    }
+  }
+  projectiles.forEach(p=>{
+    sprites.push({x:p.x,y:p.y,type:(p.owner==='player'?'player_bullet':'enemy_bullet')});
+  });
+
+  sprites.forEach(s=>{
+    s.dx=s.x-playerX;
+    s.dy=s.y-playerY;
+    s.dist=Math.sqrt(s.dx*s.dx+s.dy*s.dy);
+    s.angle=Math.atan2(s.dy,s.dx)-playerAngle;
+    if(s.angle<-Math.PI)s.angle+=2*Math.PI;
+    if(s.angle>Math.PI)s.angle-=2*Math.PI;
+  });
+  sprites.sort((a,b)=>b.dist-a.dist);
+
+  // 가림 처리 추가:
+  // 각 스프라이트에 대해 플레이어->스프라이트 방향으로 레이캐스팅
+  // 스프라이트 거리보다 벽까지의 거리가 작으면 스프라이트 그리지 않음
+  sprites.forEach(s=>{
+    if(Math.abs(s.angle)<fov/2){
+      // 라인오브사이트 확인
+      const angleToSprite=playerAngle+s.angle;
+      const wallDist=castRay(angleToSprite);
+      if(wallDist < s.dist) {
+        // 벽이 더 가까우므로 스프라이트 가려짐
+        return;
+      }
+
+      const screenX=Math.tan(s.angle)/Math.tan(fov/2)*(screenWidth/2)+(screenWidth/2);
+      const spriteHeight=screenHeight/s.dist;
+      const spriteWidth=spriteHeight;
+      const sy=(screenHeight/2 - spriteHeight/2);
+      let color='purple';
+      if(s.type==='enemy') color='red';
+      else if(s.type==='ammo') color='yellow';
+      else if(s.type==='health') color='green';
+      else if(s.type==='player_bullet') color='cyan';
+      else if(s.type==='enemy_bullet') color='orange';
+
+      ctx.fillStyle=color;
+      ctx.fillRect(screenX - spriteWidth/2, sy, spriteWidth, spriteHeight);
+    }
+  });
+
+  // 총 HUD
+  ctx.fillStyle='gray';
+  const gunWidth=40,gunHeight=40;
+  ctx.fillRect((screenWidth-gunWidth)/2, screenHeight-gunHeight-10, gunWidth, gunHeight);
+
+  if(hitOverlayAlpha>0){
+    ctx.fillStyle=`rgba(255,0,0,${hitOverlayAlpha})`;
+    ctx.fillRect(0,0,screenWidth,screenHeight);
+  }
+}
+
+function updatePlayer(dt){
+  let speed=moveSpeed*dt;
+  let dx=0,dy=0;
+  if(keys['KeyW']){dx+=Math.cos(playerAngle)*speed;dy+=Math.sin(playerAngle)*speed;}
+  if(keys['KeyS']){dx-=Math.cos(playerAngle)*speed;dy-=Math.sin(playerAngle)*speed;}
+  if(keys['KeyA']){dx+=Math.cos(playerAngle - Math.PI/2)*speed;dy+=Math.sin(playerAngle - Math.PI/2)*speed;}
+  if(keys['KeyD']){dx+=Math.cos(playerAngle + Math.PI/2)*speed;dy+=Math.sin(playerAngle + Math.PI/2)*speed;}
+
+  const newX=playerX+dx;const newY=playerY+dy;
+  if(map[Math.floor(newY)][Math.floor(newX)]!==WALL){
+    playerX=newX;playerY=newY;
+  }
+
+  playerAngle+=mouseDeltaX*rotSpeed*dt;
+  mouseDeltaX=0;
+}
+
+function checkItems(){
+  const px=Math.floor(playerX),py=Math.floor(playerY);
+  if(map[py][px]===ITEM_AMMO){playerAmmo=Math.min(30,playerAmmo+5);map[py][px]=EMPTY;}
+  else if(map[py][px]===ITEM_HEALTH){playerHealth=Math.min(100,playerHealth+20);map[py][px]=EMPTY;}
+}
+
+function updateEnemies(dt){
+  for(let i=enemies.length-1;i>=0;i--){
+    const e=enemies[i];
+    if(e.health<=0){
+      const ex=Math.floor(e.x),ey=Math.floor(e.y);
+      if(map[ey][ex]===ENEMY) map[ey][ex]=EMPTY;
+      enemies.splice(i,1);
+      continue;
+    }
+    const dx=playerX - e.x;
+    const dy=playerY - e.y;
+    const dist=Math.sqrt(dx*dx+dy*dy);
+    if(dist>4){
+      const dirX=dx/dist;const dirY=dy/dist;
+      const nx=e.x+dirX*0.005*dt;const ny=e.y+dirY*0.005*dt;
+      if(map[Math.floor(ny)][Math.floor(nx)]!==WALL){e.x=nx;e.y=ny;}
+    } else {
+      const now=performance.now();
+      if(now - e.lastShotTime>1000){
+        const angleToPlayer=Math.atan2(dy,dx);
+        projectiles.push({
+          x:e.x,y:e.y,
+          dx:Math.cos(angleToPlayer),
+          dy:Math.sin(angleToPlayer),
+          speed:0.01,
+          owner:'enemy'
+        });
+        e.lastShotTime=now;
+      }
+    }
+  }
+}
+
+function shoot(){
+  if(isReloading||playerAmmo<=0)return;
+  const now=performance.now();
+  if(now - lastShootTime<shootCooldown)return;
+  playerAmmo--;
+  lastShootTime=now;
+  projectiles.push({
+    x:playerX,y:playerY,
+    dx:Math.cos(playerAngle),dy:Math.sin(playerAngle),
+    speed:0.02,
+    owner:'player'
+  });
+}
+
+function reload(){
+  if(isReloading)return;
+  isReloading=true;
+  lastReloadTime=performance.now();
+}
+
+function updateReload(){
+  if(isReloading){
+    const now=performance.now();
+    if(now - lastReloadTime>reloadTime){
+      isReloading=false;playerAmmo=30;
+    }
+  }
+}
+
+function updateProjectiles(dt){
+  for(let i=projectiles.length-1;i>=0;i--){
+    const p=projectiles[i];
+    p.x+=p.dx*p.speed*dt;
+    p.y+=p.dy*p.speed*dt;
+
+    if(map[Math.floor(p.y)][Math.floor(p.x)]===WALL){
+      projectiles.splice(i,1);
+      continue;
+    }
+
+    if(p.owner==='player'){
+      for(let e of enemies){
+        const edx=e.x-p.x;const edy=e.y-p.y;
+        if(Math.sqrt(edx*edx+edy*edy)<0.3){
+          e.health-=25;
+          projectiles.splice(i,1);
+          break;
+        }
+      }
+    } else {
+      const pdx=playerX-p.x;const pdy=playerY-p.y;
+      if(Math.sqrt(pdx*pdx+pdy*pdy)<0.3){
+        playerHealth-=10;
+        hitOverlayAlpha=0.5;
+        projectiles.splice(i,1);
+        break;
+      }
+    }
+
+    if(p.x<0||p.x>=MAP_SIZE||p.y<0||p.y>=MAP_SIZE){
+      projectiles.splice(i,1);
+    }
+  }
+}
+
+function updateOverlay(dt){
+  if(hitOverlayAlpha>0){
+    hitOverlayAlpha=Math.max(0,hitOverlayAlpha-0.003*dt);
+  }
+}
+
+function updateUI(){
+  healthUI.textContent=playerHealth;
+  ammoUI.textContent=playerAmmo;
+}
+
+function gameLoop(){
+  const now=performance.now();
+  const dt=(now - lastTime);
+  lastTime=now;
+
+  updatePlayer(dt);
+  checkItems();
+  updateEnemies(dt);
+  updateReload();
+  updateProjectiles(dt);
+  updateOverlay(dt);
+
+  if(playerHealth<=0){
+    ctx.fillStyle='#f00';
+    ctx.fillRect(0,0,screenWidth,screenHeight);
+    ctx.fillStyle='#fff';
+    ctx.fillText("You Died", screenWidth/2-20, screenHeight/2);
+  }else{
+    drawScene();
+    updateUI();
+    requestAnimationFrame(gameLoop);
+  }
+}
+
+document.addEventListener('keydown',(e)=>{
+  keys[e.code]=true;
+  if(e.code==='Space') shoot(); // 스페이스바로 사격
+});document.addEventListener('keyup',(e)=>{keys[e.code]=false;});
+canvas.addEventListener('mousedown',(e)=>{
+  if(e.button===0) shoot();
+});
+canvas.addEventListener('contextmenu',(e)=>{
+  e.preventDefault();
+  reload();
+  return false;
+});
+document.addEventListener('mousemove',(e)=>{
+  mouseDeltaX=e.movementX;
+});
+
+generateMap();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
